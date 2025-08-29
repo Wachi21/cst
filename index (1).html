@@ -1,102 +1,141 @@
 <!DOCTYPE html>
-<html>
+<html lang="th">
 <head>
-  <title>Teachable Machine Image Model (Mobile)</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"> <!-- ทำ responsive -->
-  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@latest/dist/tf.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/@teachablemachine/image@latest/dist/teachablemachine-image.min.js"></script>
+  <meta charset="utf-8" />
+  <title>Teachable Machine + MQTT (Shape Detection) — Diagnostics</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <!-- Libs -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.21.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@teachablemachine/image@0.8.4/dist/teachablemachine-image.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/paho-mqtt/1.0.1/mqttws31.min.js"></script>
+
   <style>
-    body {
-      font-family: Arial, sans-serif;
-      text-align: center;
-      margin: 0;
-      padding: 0;
+    :root {
+      --ok:#16a34a; --warn:#eab308; --err:#dc2626; --muted:#6b7280;
+      --bg:#0b1020; --panel:#11172a; --panel2:#0f1526; --text:#e5e7eb;
     }
-    #webcam-container {
-      max-width: 100%;
-      margin: 10px auto;
-    }
-    video {
-      max-width: 100%;
-      height: auto;
-    }
-    #label-container {
-      margin: 10px;
-      font-size: 1.2em;
-    }
-    button {
-      padding: 10px 20px;
-      font-size: 1em;
-      margin: 5px;
-    }
+    body {margin:0;font-family:sans-serif;background:radial-gradient(1000px 600px at 10% -20%,#1b2550,var(--bg));color:var(--text);display:flex;flex-direction:column;align-items:center;}
+    header,footer {max-width:1100px;padding:16px;}
+    h1{margin:0 0 8px;}
+    .grid{max-width:1100px;width:100%;display:grid;gap:12px;grid-template-columns:360px 1fr;padding:8px;}
+    @media(max-width:960px){.grid{grid-template-columns:1fr}}
+    .card{background:linear-gradient(180deg,var(--panel),var(--panel2));border-radius:16px;padding:12px;border:1px solid rgba(255,255,255,.06)}
+    .dot{width:10px;height:10px;border-radius:50%;background:var(--muted)}
+    .dot.ok{background:var(--ok)}.dot.warn{background:var(--warn)}.dot.err{background:var(--err)}
+    #webcam-container canvas{max-width:640px;width:100%;border-radius:12px;border:2px solid rgba(255,255,255,.06);transition:box-shadow .3s;}
+    .labels{font-size:13px;display:grid;gap:6px;margin-top:8px}
+    .bar{background:rgba(255,255,255,.06);border-radius:8px;overflow:hidden;position:relative}
+    .bar>span{display:block;height:22px;padding:0 8px;line-height:22px}
+    .bar::after{content:"";position:absolute;inset:0;width:var(--w,0%);background:linear-gradient(90deg,#2563eb,#4f46e5);opacity:.35}
+    .log{height:200px;background:#0b1224;border-radius:12px;padding:8px;overflow:auto;font-size:12px}
   </style>
 </head>
 <body>
-  <div>Teachable Machine Image Model (Mobile)</div>
-  <button type="button" onclick="init('environment')">Start (Back Camera)</button>
-  <button type="button" onclick="init('user')">Start (Front Camera)</button>
-  <button type="button" onclick="stop()">Stop</button>
-  <div id="webcam-container"></div>
-  <div id="label-container"></div>
+<header>
+  <h1>Shape Detection + MQTT (Diagnostics)</h1>
+  <div>ระบบนี้จะตรวจจับ <b>รูปร่าง</b> (วงกลม, สามเหลี่ยม, สี่เหลี่ยม) จากกล้อง และส่งผลลัพธ์ผ่าน MQTT (WSS:8884) ไปยัง ESP32</div>
+</header>
 
-  <script type="text/javascript">
-    const URL = "https://teachablemachine.withgoogle.com/models/ahaxFn-GG/";
+<div class="grid">
+  <!-- Status -->
+  <section class="card">
+    <h3>สถานะ</h3>
+    <div><span id="dot-mqtt" class="dot"></span> MQTT: <span id="mqtt-state">-</span></div>
+    <div><span id="dot-model" class="dot"></span> Model: <span id="model-state">-</span></div>
+    <div><span id="dot-cam" class="dot"></span> Camera: <span id="cam-state">-</span></div>
+    <div><span id="dot-sub" class="dot"></span> Sub: <span id="sub-state">-</span></div>
+    <div><span id="dot-loop" class="dot"></span> RX: <span id="rx-state">-</span></div>
+  </section>
 
-    let model, webcam, labelContainer, maxPredictions;
+  <!-- Control -->
+  <section class="card">
+    <h3>ควบคุม</h3>
+    <button onclick="startAll('environment')">Start Back</button>
+    <button onclick="startAll('user')">Start Front</button>
+    <button onclick="stopAll()">Stop</button>
+    <button onclick="safePublish('TEST:'+Date.now())">Test Pub</button>
+    <button onclick="$('#log').innerHTML=''">Clear Log</button>
+  </section>
 
-    async function init(facingMode) {
-      const modelURL = URL + "model.json";
-      const metadataURL = URL + "metadata.json";
+  <!-- Camera -->
+  <section class="card" style="grid-column:1/-1">
+    <h3>กล้อง & การทำนาย</h3>
+    <div id="webcam-container"></div>
+    <div class="labels" id="label-container"></div>
+  </section>
 
-      model = await tmImage.load(modelURL, metadataURL);
-      maxPredictions = model.getTotalClasses();
+  <!-- Log -->
+  <section class="card" style="grid-column:1/-1">
+    <h3>Log</h3>
+    <div class="log" id="log"></div>
+  </section>
+</div>
 
-      // ตั้งค่า Webcam สำหรับมือถือ โดยระบุ facingMode
-      webcam = new tmImage.Webcam(224, 224, false); // ใช้ 224x224 เหมือนเดิม
-      try {
-        await webcam.setup({ facingMode: facingMode }); // เลือกกล้องหน้า (user) หรือหลัง (environment)
-        await webcam.play();
-        if (!webcam.canvas) {
-          throw new Error("Webcam canvas is not initialized");
-        }
-        console.log("Webcam initialized, width:", webcam.canvas.width, "facingMode:", facingMode);
-        window.requestAnimationFrame(loop);
-      } catch (e) {
-        console.error("Webcam setup failed:", e);
-        document.getElementById("label-container").innerText = "Error: " + e.message;
-        return;
-      }
+<footer>ระบบนี้ Publish <b>ชื่อรูปร่าง</b> ที่ตรวจเจอ เช่น "วงกลม" "สามเหลี่ยม" "สี่เหลี่ยม" ไปยัง MQTT broker ที่คุณตั้งค่าไว้</footer>
 
-      document.getElementById("webcam-container").appendChild(webcam.canvas);
-      labelContainer = document.getElementById("label-container");
-      labelContainer.innerHTML = ""; // ล้างผลลัพธ์เก่า
-      for (let i = 0; i < maxPredictions; i++) {
-        labelContainer.appendChild(document.createElement("div"));
-      }
-    }
+<script>
+/* CONFIG */
+const TM_URL = "https://teachablemachine.withgoogle.com/models/xxxxx/"; // <-- โปรเจ็กต์ shape ของคุณ
+const MQTT_HOST="broker.hivemq.com", MQTT_PORT=8884, MQTT_PATH="/mqtt", MQTT_TOPIC="shapes1";
+const CONF_THRESHOLD=0.85, PUBLISH_DEBOUNCE_MS=3000;
 
-    async function loop() {
-      webcam.update();
-      await predict();
-      window.requestAnimationFrame(loop);
-    }
+/* UI helpers */
+const $=s=>document.querySelector(s);
+const dot=(el,st)=>{el.classList.remove('ok','warn','err');if(st)el.classList.add(st)};
+const log=(...a)=>{let l=$('#log');let d=document.createElement('div');d.textContent=a.join(' ');l.appendChild(d);l.scrollTop=l.scrollHeight;console.log(...a)};
 
-    async function predict() {
-      const prediction = await model.predict(webcam.canvas);
-      for (let i = 0; i < maxPredictions; i++) {
-        const classPrediction = prediction[i].className + ": " + prediction[i].probability.toFixed(2);
-        labelContainer.childNodes[i].innerHTML = classPrediction;
-      }
-    }
+/* MQTT */
+let mqttClient=null, clientId=null;
+function connectMQTT(){
+  return new Promise((res,rej)=>{
+    clientId="web_"+Math.floor(Math.random()*1e5);
+    mqttClient=new Paho.MQTT.Client(MQTT_HOST,Number(MQTT_PORT),MQTT_PATH,clientId);
+    mqttClient.onConnectionLost=()=>{dot($('#dot-mqtt'),'err');};
+    mqttClient.onMessageArrived=(m)=>{dot($('#dot-loop'),'ok');$('#rx-state').textContent=m.payloadString;log("RX:",m.payloadString)};
+    const will=new Paho.MQTT.Message(JSON.stringify({clientId,status:"offline"}));
+    will.destinationName=MQTT_TOPIC+"/status";will.retained=true;
+    mqttClient.connect({useSSL:true,timeout:15,keepAliveInterval:60,willMessage:will,onSuccess:()=>{
+      dot($('#dot-mqtt'),'ok');$('#mqtt-state').textContent="connected";log("MQTT connected");
+      mqttClient.subscribe(MQTT_TOPIC+"/#",{});dot($('#dot-sub'),'ok');
+      res();
+    },onFailure:e=>{dot($('#dot-mqtt'),'err');rej(e)}});
+  });
+}
+function safePublish(payload){
+  if(!mqttClient||!mqttClient.isConnected())return false;
+  try{let m=new Paho.MQTT.Message(payload);m.destinationName=MQTT_TOPIC;mqttClient.send(m);log("TX:",payload);return true}catch(e){log("Pub error",e);return false}
+}
 
-    function stop() {
-      if (webcam) {
-        webcam.stop();
-        document.getElementById("webcam-container").innerHTML = '';
-        document.getElementById("label-container").innerHTML = '';
-      }
-    }
-  </script>
+/* Teachable Machine */
+let model,webcam,labelContainer,maxPredictions,lastSentAt=0,running=false;
+async function loadModel(){
+  dot($('#dot-model'),'warn');$('#model-state').textContent="loading";
+  model=await tmImage.load(TM_URL+"model.json",TM_URL+"metadata.json");
+  maxPredictions=model.getTotalClasses();
+  buildLabels();dot($('#dot-model'),'ok');$('#model-state').textContent="ready("+maxPredictions+")";
+}
+function buildLabels(){labelContainer=$('#label-container');labelContainer.innerHTML='';for(let i=0;i<maxPredictions;i++){let r=document.createElement('div');r.className='bar';r.appendChild(document.createElement('span'));labelContainer.appendChild(r)}}
+async function startCamera(face){
+  webcam=new tmImage.Webcam(320,320,false);await webcam.setup({facingMode:face});await webcam.play();
+  $('#webcam-container').innerHTML='';$('#webcam-container').appendChild(webcam.canvas);dot($('#dot-cam'),'ok');$('#cam-state').textContent="streaming";
+}
+function flashBorder(shape){
+  let cam=$('#webcam-container canvas');
+  cam.style.boxShadow="0 0 25px "+(shape=="วงกลม"?"red":shape=="สามเหลี่ยม"?"yellow":"blue");
+  setTimeout(()=>cam.style.boxShadow="",1200);
+}
+async function predict(){
+  const preds=await model.predict(webcam.canvas);
+  preds.forEach((p,i)=>{let row=labelContainer.children[i];row.style.setProperty('--w',Math.round(p.probability*100)+"%");row.firstChild.textContent=`${p.className}: ${p.probability.toFixed(2)}`});
+  let best=preds.reduce((a,b)=>b.probability>a.probability?b:a);
+  if(best.probability>=CONF_THRESHOLD && Date.now()-lastSentAt>PUBLISH_DEBOUNCE_MS){
+    lastSentAt=Date.now();let ok=safePublish(best.className);if(ok)flashBorder(best.className);dot($('#dot-loop'),ok?'warn':'err');
+  }
+}
+async function loop(){if(!running)return;webcam.update();await predict();requestAnimationFrame(loop)}
+async function startAll(face){running=false;await connectMQTT().catch(()=>{});await loadModel();await startCamera(face);running=true;loop()}
+function stopAll(){running=false;try{webcam.stop()}catch{};$('#webcam-container').innerHTML='';dot($('#dot-cam'),'err')}
+</script>
 </body>
-
 </html>
